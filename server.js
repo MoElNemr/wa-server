@@ -500,19 +500,31 @@ app.post(['/api/sessions/pairing-code', '/api/sessions/:sessionId/pairing-code']
             });
         }
 
+        // Wait until WhatsApp companion registration handshake is ready (signaled by session.qr or connection open)
         let attempts = 0;
-        while (attempts < 25 && (!session.sock || session.sock.ws?.readyState !== 1)) {
+        while (attempts < 35 && !session.qr && session.status !== 'connected') {
             await new Promise(r => setTimeout(r, 200));
             attempts++;
         }
 
+        if (session.status === 'connected') {
+            return res.json({
+                status: 'connected',
+                session_id: sessionId,
+                phone_number: session.phoneNumber,
+                message: 'الحساب متصل بالفعل!'
+            });
+        }
+
         const code = await session.sock.requestPairingCode(phoneNumber);
-        console.log(`[Session ${sessionId}] Pairing code generated for ${phoneNumber}: ${code}`);
+        const formattedCode = code ? (code.match(/.{1,4}/g)?.join(' - ') || code) : code;
+        console.log(`[Session ${sessionId}] Pairing code generated for ${phoneNumber}: ${formattedCode}`);
 
         return res.json({
             status: 'pairing_code_ready',
             session_id: sessionId,
-            pairing_code: code
+            pairing_code: formattedCode,
+            raw_code: code
         });
     } catch (err) {
         console.error(`[Session ${sessionId}] Pairing code error:`, err);

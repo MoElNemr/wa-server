@@ -418,9 +418,22 @@ app.post(['/api/sessions/:sessionId/messages', '/api/instance/send'], async (req
     }
 
     try {
-        // Format recipient JID
-        const cleanRecipient = String(to).replace(/[^0-9]/g, '');
-        const targetJid = to.includes('@') ? to : `${cleanRecipient}@s.whatsapp.net`;
+        // Format recipient JID: support full JIDs (@lid, @s.whatsapp.net), known LIDs, and standard phone numbers
+        let targetJid;
+        if (String(to).includes('@')) {
+            targetJid = String(to).trim();
+        } else {
+            const cleanRecipient = String(to).replace(/[^0-9]/g, '');
+            const sessionDir = getSessionDir(sessionId);
+
+            // Check if recipient is a WhatsApp LID (via session files, tctoken, or 15+ digits identifier)
+            const isLid = fs.existsSync(path.join(sessionDir, `device-list-${cleanRecipient}.json`)) ||
+                          fs.existsSync(path.join(sessionDir, `identity-key-${cleanRecipient}_1.0.json`)) ||
+                          fs.existsSync(path.join(sessionDir, `tctoken-${cleanRecipient}@lid.json`)) ||
+                          cleanRecipient.length >= 15;
+
+            targetJid = isLid ? `${cleanRecipient}@lid` : `${cleanRecipient}@s.whatsapp.net`;
+        }
 
         const sent = await session.sock.sendMessage(targetJid, { text });
         const messageId = sent?.key?.id || `WA_${Date.now()}`;

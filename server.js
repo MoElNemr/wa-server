@@ -118,11 +118,16 @@ async function startSession(sessionId, meta = {}) {
 
         // 1. QR code received
         if (qr) {
-            console.log(`[Session ${sessionId}] QR code generated.`);
-            sessionEntry.qr = qr;
+            const cleanQr = qr.includes('#') ? qr.split('#')[1] : qr;
+            console.log(`[Session ${sessionId}] QR code generated (standard format: ${cleanQr.substring(0, 15)}...).`);
+            sessionEntry.qr = cleanQr;
             sessionEntry.status = 'connecting';
             try {
-                sessionEntry.qrImage = await qrcode.toDataURL(qr, { margin: 2, scale: 6 });
+                sessionEntry.qrImage = await qrcode.toDataURL(cleanQr, {
+                    margin: 2,
+                    scale: 6,
+                    errorCorrectionLevel: 'M'
+                });
             } catch (qrErr) {
                 console.error(`[Session ${sessionId}] Failed to generate QR image: ${qrErr.message}`);
                 sessionEntry.qrImage = null;
@@ -132,8 +137,8 @@ async function startSession(sessionId, meta = {}) {
                 session_id: sessionId,
                 business_id: sessionEntry.businessId,
                 status: 'qr',
-                qr_code: sessionEntry.qrImage || qr,
-                qr_raw: qr,
+                qr_code: sessionEntry.qrImage || cleanQr,
+                qr_raw: cleanQr,
                 qr_image: sessionEntry.qrImage
             });
         }
@@ -474,6 +479,45 @@ app.get(['/api/sessions/:sessionId/qr', '/api/instance/:sessionId/qr'], async (r
         qr_image: session.qrImage,
         qr_raw: session.qr
     });
+});
+
+// Request 8-digit Pairing Code for phone number linking
+app.post(['/api/sessions/pairing-code', '/api/sessions/:sessionId/pairing-code'], async (req, res) => {
+    const rawId = req.params?.sessionId || req.body?.session_id || (req.body?.business_id ? `session_${req.body.business_id}` : null);
+    const phoneNumber = String(req.body?.phone_number || '').replace(/[^0-9]/g, '');
+
+    if (!rawId || !phoneNumber) {
+        return res.status(400).json({ error: 'Missing session_id or phone_number parameter' });
+    }
+
+    const sessionId = String(rawId).startsWith('session_') ? String(rawId) : `session_${rawId}`;
+    try {
+        let session = activeSessions[sessionId];
+        if (!session || !session.sock) {
+            session = await startSession(sessionId, {
+                business_id: req.body?.business_id || sessionId.replace('session_', ''),
+                webhook_url: req.body?.webhook_url
+            });
+        }
+
+        let attempts = 0;
+        while (attempts < 25 && (!session.sock || session.sock.ws?.readyState !== 1)) {
+            await new Promise(r => setTimeout(r, 200));
+            attempts++;
+        }
+
+        const code = await session.sock.requestPairingCode(phoneNumber);
+        console.log(`[Session ${sessionId}] Pairing code generated for ${phoneNumber}: ${code}`);
+
+        return res.json({
+            status: 'pairing_code_ready',
+            session_id: sessionId,
+            pairing_code: code
+        });
+    } catch (err) {
+        console.error(`[Session ${sessionId}] Pairing code error:`, err);
+        return res.status(500).json({ error: err.message });
+    }
 });
 
 // Logout / disconnect session

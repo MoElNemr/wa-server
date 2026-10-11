@@ -1,237 +1,498 @@
-const { default: makeWASocket, useMultiFileAuthState, DisconnectReason } = require('@whiskeysockets/baileys');
+const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, Browsers } = require('@whiskeysockets/baileys');
 const pino = require('pino');
 const express = require('express');
 const fs = require('fs');
 const path = require('path');
 const axios = require('axios');
+const qrcode = require('qrcode');
+
+const PORT = process.env.PORT || 3000;
+const AUTH_BASE_DIR = path.join(__dirname, 'auth_info');
+const LOGGER = pino({ level: 'silent' });
+
+if (!fs.existsSync(AUTH_BASE_DIR)) {
+    fs.mkdirSync(AUTH_BASE_DIR, { recursive: true });
+}
 
 const app = express();
 app.use(express.json());
 
-const LOGGER = pino({ level: 'silent' });
-// الرابط المباشر لـ API الـ Webhook في اللارافيل
-const LARAVEL_API = 'http://127.0.0.1:8000/api/whatsapp/webhook';
+// In-memory active session registry
+// Key: sessionId (string) -> { sock, sessionId, businessId, webhookUrl, status, phoneNumber, qr, qrImage, lastActiveAt }
+const activeSessions = {};
 
-// القاموس السحري اللي بيشيل الـ Sockets الشغالة في الذاكرة
-const activeInstances = {};
+/**
+ * Resolve session folder path securely.
+ */
+function getSessionDir(sessionId) {
+    const cleanId = String(sessionId).replace(/[^a-zA-Z0-9_-]/g, '_');
+    return path.join(AUTH_BASE_DIR, `session_${cleanId}`);
+}
 
-async function startInstance(instanceId) {
-    // 💡 منع التكرار: لو الجلسة قايمة بالفعل في الذاكرة وشغالة، استخدمها بدلاً من فتح سوكيت جديد
-    if (activeInstances[instanceId]) {
-        console.log(`ℹ️ [Instance ${instanceId}] Already active in memory. Reusing existing socket.`);
-        return activeInstances[instanceId];
+/**
+ * Dispatch webhook payload to Laravel backend.
+ */
+async function dispatchWebhook(sessionEntry, event, data) {
+    const targetUrl = sessionEntry.webhookUrl;
+    if (!targetUrl) return;
+
+    try {
+        await axios.post(targetUrl, { event, data }, {
+            timeout: 8000,
+            headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' }
+        });
+        console.log(`[Session ${sessionEntry.sessionId}] Webhook "${event}" delivered to ${targetUrl}`);
+    } catch (err) {
+        console.warn(`[Session ${sessionEntry.sessionId}] Webhook "${event}" delivery failed: ${err.message}`);
+    }
+}
+
+/**
+ * Start or resume a WhatsApp Baileys session.
+ */
+async function startSession(sessionId, meta = {}) {
+    sessionId = String(sessionId);
+
+    // Return existing socket if active
+    if (activeSessions[sessionId] && activeSessions[sessionId].sock) {
+        console.log(`[Session ${sessionId}] Existing active session found. Reusing socket.`);
+        return activeSessions[sessionId];
     }
 
-    // حفظ بيانات كل رقم في فولدر منفصل بناءً على الـ ID لضمان عدم التداخل
-    const { state, saveCreds } = await useMultiFileAuthState(`auth_info/instance_${instanceId}`);
+    const sessionDir = getSessionDir(sessionId);
+    if (!fs.existsSync(sessionDir)) {
+        fs.mkdirSync(sessionDir, { recursive: true });
+    }
+
+    const businessId = meta.business_id || meta.businessId || sessionId.replace(/^session_/, '');
+    const webhookUrl = meta.webhook_url || meta.webhookUrl || `http://127.0.0.1:8000/webhooks/whatsapp/${businessId}`;
+
+    // Persist session metadata for auto-boot on server restart
+    const metaFilePath = path.join(sessionDir, 'meta.json');
+    try {
+        fs.writeFileSync(metaFilePath, JSON.stringify({
+            sessionId,
+            businessId,
+            webhookUrl,
+            updatedAt: new Date().toISOString()
+        }, null, 2));
+    } catch (err) {
+        console.error(`[Session ${sessionId}] Failed to save metadata: ${err.message}`);
+    }
+
+    const sessionEntry = {
+        sessionId,
+        businessId,
+        webhookUrl,
+        sock: null,
+        status: 'connecting',
+        phoneNumber: null,
+        qr: null,
+        qrImage: null,
+        lastActiveAt: new Date().toISOString()
+    };
+    activeSessions[sessionId] = sessionEntry;
+
+    const { state, saveCreds } = await useMultiFileAuthState(sessionDir);
 
     const sock = makeWASocket({
         auth: state,
         logger: LOGGER,
-        printQRInTerminal: false, // بنبعته للارافيل يظهره في الداشبورد
+        printQRInTerminal: false,
+        browser: Browsers.ubuntu('Chrome'),
         connectTimeoutMs: 60000,
-        keepAliveIntervalMs: 30000
+        keepAliveIntervalMs: 30000,
+        syncFullHistory: false
     });
 
-    activeInstances[instanceId] = sock;
+    sessionEntry.sock = sock;
 
-    // 💡 ربط حدث استقبال الرسايل فوراً مع الـ Initialization لضمان عدم سقوط أي رسالة
-    sock.ev.on('messages.upsert', async (m) => {
-        if (m.type !== 'notify') return;
+    // Save credentials on updates
+    sock.ev.on('creds.update', saveCreds);
 
-        for (const msg of m.messages) {
-            // تجاهل الرسايل المرسلة مني، أو الرسايل الفاضية بدون نص
-            if (msg.key.fromMe || !msg.message) continue;
-
-            const from = msg.key.remoteJid;
-            
-            // 💡 دعم قراءة النصوص والتعليقات المصاحبة للصور والفيديوهات والمستندات
-            const text = msg.message.conversation || 
-                         msg.message.extendedTextMessage?.text || 
-                         msg.message.imageMessage?.caption || 
-                         msg.message.videoMessage?.caption || 
-                         msg.message.documentMessage?.caption;
-
-            if (text) {
-                console.log(`📩 [Instance ${instanceId}] Received: "${text}" from [${from}]`);
-
-                // تمرير الرسالة فوراً للارافيل عشان يرميها في الـ Queue ويشغل الـ AI
-                axios.post(`${LARAVEL_API}/message`, {
-                    instance_id: instanceId,
-                    from: from,
-                    text: text
-                }).catch(err => console.error(`❌ Laravel offline or error syncing message for Instance ${instanceId}`));
-            }
-        }
-    });
-
-    // مراقبة حالة الاتصال (QR، فتح، قفل)
+    // Monitor connection events
     sock.ev.on('connection.update', async (update) => {
         const { connection, lastDisconnect, qr } = update;
 
-        // 1. لو في QR Code طلع، ابعته فوراً للارافيل عشان يظهر في داشبورد العميل
+        // 1. QR code received
         if (qr) {
-            console.log(`[Instance ${instanceId}] QR Generated`);
+            console.log(`[Session ${sessionId}] QR code generated.`);
+            sessionEntry.qr = qr;
+            sessionEntry.status = 'connecting';
             try {
-                await axios.post(`${LARAVEL_API}/qr`, { instance_id: instanceId, qr: qr });
-                console.log(`🔹 QR Sent to Laravel successfully for Instance ${instanceId}`);
-            } catch (err) {
-                console.error(`❌ Failed to send QR to Laravel:`, err.response?.data || err.message);
+                sessionEntry.qrImage = await qrcode.toDataURL(qr);
+            } catch (qrErr) {
+                console.error(`[Session ${sessionId}] Failed to generate QR image: ${qrErr.message}`);
+                sessionEntry.qrImage = null;
             }
+
+            await dispatchWebhook(sessionEntry, 'connection.update', {
+                session_id: sessionId,
+                business_id: sessionEntry.businessId,
+                status: 'qr',
+                qr_code: sessionEntry.qrImage || qr,
+                qr_raw: qr,
+                qr_image: sessionEntry.qrImage
+            });
         }
 
-        // 2. لو الاتصال اتقفل لأي سبب
+        // 2. Connection closed
         if (connection === 'close') {
             const statusCode = lastDisconnect?.error?.output?.statusCode;
             const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
-            
-            console.log(`[Instance ${instanceId}] Connection closed. Reconnecting: ${shouldReconnect}`);
-            
-            delete activeInstances[instanceId]; // شيله من الذاكرة مؤقتاً
-            
+
+            console.log(`[Session ${sessionId}] Connection closed (status: ${statusCode}). Reconnect: ${shouldReconnect}`);
+            sessionEntry.status = 'disconnected';
+            delete activeSessions[sessionId];
+
             if (!shouldReconnect) {
-                // 💡 مسح مجلد الجلسة عند تسجيل الخروج التام لمنع تكرار محاولة الاتصال التلقائي اللانهائي
-                const sessionPath = path.join(__dirname, 'auth_info', `instance_${instanceId}`);
-                if (fs.existsSync(sessionPath)) {
+                console.log(`[Session ${sessionId}] User logged out. Cleaning up credentials.`);
+                if (fs.existsSync(sessionDir)) {
                     try {
-                        fs.rmSync(sessionPath, { recursive: true, force: true });
-                        console.log(`🗑️ [Instance ${instanceId}] Cleaned up logged out session credentials from disk.`);
+                        fs.rmSync(sessionDir, { recursive: true, force: true });
                     } catch (err) {
-                        console.error(`❌ Failed to clean up session files:`, err.message);
+                        console.error(`[Session ${sessionId}] Failed removing files: ${err.message}`);
                     }
                 }
-            } else {
-                startInstance(instanceId); // إعادة محاولة الاتصال تلقائياً
-            }
-        } 
-        // 3. لو الرقم فتح وبقى جاهز ومسجل دخول
-        else if (connection === 'open') {
-            console.log(`🚀 [Instance ${instanceId}] Connected and Ready in Memory!`);
-            try {
-                // جلب رقم الموبايل الحقيقي وتجهيزه من الـ JID
-                const rawJid = sock.user.id;
-                const formattedNumber = rawJid.split(':')[0] || rawJid.split('@')[0];
 
-                // نبلغ لارافيل إن الحالة متصل ونبعتله الرقم يسيفه
-                await axios.post(`${LARAVEL_API}/status`, { 
-                    instance_id: instanceId, 
-                    status: 'connected',
-                    phone_number: formattedNumber
+                await dispatchWebhook(sessionEntry, 'connection.update', {
+                    session_id: sessionId,
+                    business_id: sessionEntry.businessId,
+                    status: 'disconnected'
                 });
-                console.log(`🔹 Connected status and phone [${formattedNumber}] sent to Laravel.`);
-            } catch (err) {
-                console.error(`❌ Failed to send connected status to Laravel:`, err.message);
+            } else {
+                // Exponential reconnect backoff
+                setTimeout(() => {
+                    startSession(sessionId, { businessId, webhookUrl })
+                        .catch(err => console.error(`[Session ${sessionId}] Reconnect failed: ${err.message}`));
+                }, 4000);
             }
         }
+
+        // 3. Connection open
+        else if (connection === 'open') {
+            const rawJid = sock.user?.id || '';
+            const formattedNumber = rawJid.split(':')[0] || rawJid.split('@')[0];
+
+            sessionEntry.status = 'connected';
+            sessionEntry.phoneNumber = formattedNumber;
+            sessionEntry.qr = null;
+            sessionEntry.qrImage = null;
+
+            console.log(`[Session ${sessionId}] WhatsApp connected. Number: ${formattedNumber}`);
+
+            await dispatchWebhook(sessionEntry, 'connection.update', {
+                session_id: sessionId,
+                business_id: sessionEntry.businessId,
+                status: 'connected',
+                phone_number: formattedNumber
+            });
+        }
     });
 
-    // حفظ ملفات الجلسة وتحديثها تلقائياً عند التغيير
-    sock.ev.on('creds.update', saveCreds);
-    return sock;
+    // Handle inbound messages
+    sock.ev.on('messages.upsert', async (upsert) => {
+        if (upsert.type !== 'notify') return;
+
+        for (const msg of upsert.messages) {
+            if (!msg.message || msg.key.fromMe) continue;
+
+            const from = msg.key.remoteJid;
+            if (!from || from === 'status@broadcast') continue;
+
+            const text = msg.message.conversation ||
+                         msg.message.extendedTextMessage?.text ||
+                         msg.message.imageMessage?.caption ||
+                         msg.message.videoMessage?.caption ||
+                         msg.message.documentMessage?.caption ||
+                         null;
+
+            const messageId = msg.key.id || `WA_${Date.now()}`;
+            const pushName = msg.pushName || null;
+
+            console.log(`[Session ${sessionId}] Inbound message from [${from}]: "${text || '[media]'}"`);
+
+            await dispatchWebhook(sessionEntry, 'messages.upsert', {
+                session_id: sessionId,
+                business_id: sessionEntry.businessId,
+                from: from,
+                push_name: pushName,
+                message_id: messageId,
+                text: text || '[رسالة وسائط]'
+            });
+        }
+    });
+
+    return sessionEntry;
 }
 
-// ميزة الـ Auto-Boot: أول ما سيرفر النود يقوم، يصحّي كل الأرقام المسجلة سابقاً تلقائياً
-function autoBootInstances() {
-    const authDir = path.join(__dirname, 'auth_info');
-    if (!fs.existsSync(authDir)) return;
+/**
+ * Auto-boot previously saved sessions on startup.
+ */
+function autoBootSessions() {
+    if (!fs.existsSync(AUTH_BASE_DIR)) return;
 
-    const folders = fs.readdirSync(authDir);
-    folders.forEach(folder => {
-        if (folder.startsWith('instance_')) {
-            const instanceId = folder.replace('instance_', '');
-            console.log(`⚙️ [Auto-Boot] Found saved session for Instance ID: ${instanceId}. Starting...`);
-            startInstance(instanceId);
+    const entries = fs.readdirSync(AUTH_BASE_DIR);
+    entries.forEach(entry => {
+        if (entry.startsWith('session_') || entry.startsWith('instance_')) {
+            const sessionPath = path.join(AUTH_BASE_DIR, entry);
+            const metaPath = path.join(sessionPath, 'meta.json');
+
+            let meta = {};
+            if (fs.existsSync(metaPath)) {
+                try {
+                    meta = JSON.parse(fs.readFileSync(metaPath, 'utf8'));
+                } catch (e) {
+                    // Ignore parse error
+                }
+            }
+
+            const sessionId = meta.sessionId || (entry.startsWith('session_') ? entry : `session_${entry.replace('instance_', '')}`);
+            console.log(`[Auto-Boot] Restoring WhatsApp session: ${sessionId}`);
+            startSession(sessionId, meta).catch(err => {
+                console.error(`[Auto-Boot] Failed to restore session ${sessionId}: ${err.message}`);
+            });
         }
     });
 }
 
-// endpoint to check the numbers that are currently active in memory to update the dashboard in laravel
-// الـ Endpoint اللي لارافيل بيعرف منها مين قايم في الذاكرة حالياً
-app.get('/api/instances/active', (request, response) => {
-    // تحويل الـ Keys لأرقام برضه زيادة تأكيد
-    const activeInstanceIds = Object.keys(activeInstances).map(Number);
-    return response.json({ active_instances: activeInstanceIds });
+// -----------------------------------------------------------------------------
+// REST API Endpoints
+// -----------------------------------------------------------------------------
+
+// Health check
+app.get('/health', (req, res) => {
+    res.json({
+        status: 'ok',
+        uptime: process.uptime(),
+        active_sessions_count: Object.keys(activeSessions).length
+    });
+});
+app.get('/api/health', (req, res) => {
+    res.json({
+        status: 'ok',
+        uptime: process.uptime(),
+        active_sessions_count: Object.keys(activeSessions).length
+    });
 });
 
-// [Endpoint 1] لارافيل بيكلمها لما العميل يدوس "إضافة رقم جديد" من الداشبورد
-app.post('/api/instance/init', async (request, response) => {
-    console.log(`📥 [Incoming Request] Received init for Instance ID:`, request.body.instance_id);
+// List all active sessions
+app.get(['/api/sessions', '/api/instances/active'], (req, res) => {
+    const list = Object.keys(activeSessions).map(id => {
+        const s = activeSessions[id];
+        return {
+            session_id: s.sessionId,
+            business_id: s.businessId,
+            status: s.status,
+            phone_number: s.phoneNumber,
+            has_qr: Boolean(s.qr)
+        };
+    });
 
-    const { instance_id } = request.body;
-    if (!instance_id) return response.status(400).json({ error: 'Missing instance_id' });
-
-    try {
-        startInstance(instance_id);
-        return response.json({ success: true, message: `Instance ${instance_id} initialization started.` });
-    } catch (error) {
-        console.error('❌ Error inside init endpoint:', error.message);
-        return response.status(500).json({ error: error.message });
-    }
+    res.json({
+        active_instances: Object.keys(activeSessions),
+        sessions: list
+    });
 });
 
-// [Endpoint 2] لارافيل بيكلمها عشان يبعت الرد النهائي للعميل بعد معالجة الـ AI
-app.post('/api/instance/send', async (request, response) => {
-    const { instance_id, to, text } = request.body;
+// Start session / request QR code
+// Standard: POST /api/sessions/start
+// Legacy: POST /api/instance/init
+app.post(['/api/sessions/start', '/api/instance/init'], async (req, res) => {
+    const body = req.body || {};
+    const rawId = body.session_id || body.instance_id || (body.business_id ? `session_${body.business_id}` : null);
 
-    if (!instance_id || !to || !text) {
-        return response.status(400).json({ error: 'Missing parameters (instance_id, to, or text)' });
+    if (!rawId) {
+        return res.status(400).json({ error: 'Missing session_id or business_id parameter' });
     }
 
+    const sessionId = String(rawId).startsWith('session_') ? String(rawId) : `session_${rawId}`;
+    const businessId = body.business_id || sessionId.replace('session_', '');
+    const webhookUrl = body.webhook_url || null;
+
     try {
-        // جلب الـ socket الخاص بالرقم ده من الذاكرة
-        const sock = activeInstances[instance_id];
-        
-        if (!sock) {
-            return response.status(404).json({ error: `Instance ${instance_id} is not active in memory.` });
+        const existing = activeSessions[sessionId];
+
+        if (existing && existing.status === 'connected') {
+            return res.json({
+                status: 'connected',
+                session_id: sessionId,
+                phone_number: existing.phoneNumber,
+                message: 'Session is already connected.'
+            });
         }
 
-        // إرسال الرسالة للعميل على الواتساب
-        await sock.sendMessage(to, { text: text });
-        console.log(`📤 [Instance ${instance_id}] AI Reply Sent to [${to}]`);
+        if (existing && existing.qr) {
+            return res.json({
+                status: 'qr_ready',
+                session_id: sessionId,
+                qr_code: existing.qrImage || existing.qr,
+                qr_image: existing.qrImage,
+                qr_raw: existing.qr
+            });
+        }
 
-        return response.json({ success: true, message: 'Message sent successfully.' });
-    } catch (error) {
-        console.error(`❌ Error sending message for Instance ${instance_id}:`, error.message);
-        return response.status(500).json({ error: error.message });
+        // Start session
+        const session = await startSession(sessionId, {
+            business_id: businessId,
+            webhook_url: webhookUrl
+        });
+
+        // Wait up to 3 seconds for immediate QR generation before returning response
+        let attempts = 0;
+        while (attempts < 15 && !session.qr && session.status !== 'connected') {
+            await new Promise(resolve => setTimeout(resolve, 200));
+            attempts++;
+        }
+
+        if (session.status === 'connected') {
+            return res.json({
+                status: 'connected',
+                session_id: sessionId,
+                phone_number: session.phoneNumber
+            });
+        }
+
+        if (session.qr) {
+            return res.json({
+                status: 'qr_ready',
+                session_id: sessionId,
+                qr_code: session.qrImage || session.qr,
+                qr_image: session.qrImage,
+                qr_raw: session.qr
+            });
+        }
+
+        return res.json({
+            status: 'connecting',
+            session_id: sessionId,
+            message: 'Session initialization in progress, QR will be pushed via webhook.'
+        });
+    } catch (err) {
+        console.error(`[API] Error initializing session ${sessionId}:`, err);
+        return res.status(500).json({ error: err.message });
     }
 });
 
-// [Endpoint 3] لتسجيل خروج الجلسة وفصلها من سيرفر نود والداتابيز
-app.post('/api/instance/logout', async (request, response) => {
-    const { instance_id } = request.body;
-    if (!instance_id) return response.status(400).json({ error: 'Missing instance_id' });
+// Outbound message sending
+// Standard: POST /api/sessions/:sessionId/messages
+// Legacy: POST /api/instance/send
+app.post(['/api/sessions/:sessionId/messages', '/api/instance/send'], async (req, res) => {
+    const paramId = req.params?.sessionId;
+    const bodyId = req.body?.instance_id || req.body?.session_id;
+    const rawId = paramId || bodyId;
 
-    console.log(`📥 [Incoming Request] Logging out Instance ID: ${instance_id}`);
+    if (!rawId) {
+        return res.status(400).json({ error: 'Missing session_id or instance_id parameter' });
+    }
+
+    const sessionId = String(rawId).startsWith('session_') ? String(rawId) : `session_${rawId}`;
+    const { to, text } = req.body || {};
+
+    if (!to || !text) {
+        return res.status(400).json({ error: 'Missing required parameters: to, text' });
+    }
+
+    const session = activeSessions[sessionId];
+    if (!session || !session.sock || session.status !== 'connected') {
+        return res.status(404).json({
+            status: 'failed',
+            error: `Session ${sessionId} is not connected or active in memory.`
+        });
+    }
 
     try {
-        const sock = activeInstances[instance_id];
-        if (sock) {
+        // Format recipient JID
+        const cleanRecipient = String(to).replace(/[^0-9]/g, '');
+        const targetJid = to.includes('@') ? to : `${cleanRecipient}@s.whatsapp.net`;
+
+        const sent = await session.sock.sendMessage(targetJid, { text });
+        const messageId = sent?.key?.id || `WA_${Date.now()}`;
+
+        console.log(`[Session ${sessionId}] Outbound message sent to [${targetJid}]: ID ${messageId}`);
+
+        return res.json({
+            status: 'success',
+            message_id: messageId,
+            to: targetJid,
+            timestamp: Date.now()
+        });
+    } catch (err) {
+        console.error(`[Session ${sessionId}] Error sending message:`, err);
+        return res.status(500).json({ status: 'failed', error: err.message });
+    }
+});
+
+// Single session details / status
+app.get(['/api/sessions/:sessionId', '/api/instance/:sessionId'], (req, res) => {
+    const rawId = req.params.sessionId;
+    const sessionId = String(rawId).startsWith('session_') ? String(rawId) : `session_${rawId}`;
+    const session = activeSessions[sessionId];
+
+    if (!session) {
+        return res.status(404).json({ error: `Session ${sessionId} not found.` });
+    }
+
+    res.json({
+        session_id: session.sessionId,
+        business_id: session.businessId,
+        status: session.status,
+        phone_number: session.phoneNumber,
+        qr_code: session.qrImage || session.qr,
+        qr_image: session.qrImage
+    });
+});
+
+// Logout / disconnect session
+// Standard: DELETE /api/sessions/:sessionId
+// Aliases: POST /api/sessions/:sessionId/logout, POST /api/instance/logout
+const handleLogout = async (req, res) => {
+    const rawId = req.params?.sessionId || req.body?.session_id || req.body?.instance_id;
+
+    if (!rawId) {
+        return res.status(400).json({ error: 'Missing session_id or instance_id parameter' });
+    }
+
+    const sessionId = String(rawId).startsWith('session_') ? String(rawId) : `session_${rawId}`;
+    console.log(`[API] Terminating session: ${sessionId}`);
+
+    const session = activeSessions[sessionId];
+    if (session && session.sock) {
+        try {
+            await session.sock.logout();
+        } catch (err) {
+            console.warn(`[Session ${sessionId}] Baileys logout error: ${err.message}`);
             try {
-                await sock.logout();
-            } catch (err) {
-                console.log(`[Instance ${instance_id}] Baileys logout error (might be already disconnected): ${err.message}`);
-                sock.end();
-            }
-            delete activeInstances[instance_id];
+                session.sock.end();
+            } catch (e) {}
         }
-
-        // مسح مجلد الجلسة
-        const sessionPath = path.join(__dirname, 'auth_info', `instance_${instance_id}`);
-        if (fs.existsSync(sessionPath)) {
-            fs.rmSync(sessionPath, { recursive: true, force: true });
-            console.log(`🗑️ [Instance ${instance_id}] Session files removed via logout API.`);
-        }
-
-        return response.json({ success: true, message: `Instance ${instance_id} logged out successfully.` });
-    } catch (error) {
-        console.error('❌ Error inside logout endpoint:', error.message);
-        return response.status(500).json({ error: error.message });
     }
+
+    delete activeSessions[sessionId];
+
+    const sessionDir = getSessionDir(sessionId);
+    if (fs.existsSync(sessionDir)) {
+        try {
+            fs.rmSync(sessionDir, { recursive: true, force: true });
+        } catch (err) {
+            console.error(`[Session ${sessionId}] Error removing session folder:`, err.message);
+        }
+    }
+
+    return res.json({
+        success: true,
+        message: `Session ${sessionId} logged out and cleaned up successfully.`
+    });
+};
+
+app.delete('/api/sessions/:sessionId', handleLogout);
+app.post('/api/sessions/:sessionId/logout', handleLogout);
+app.post('/api/instance/logout', handleLogout);
+
+// Start HTTP Server
+const server = app.listen(PORT, () => {
+    console.log(`🚀 VERTEX WhatsApp Baileys Service running on port ${PORT}`);
+    autoBootSessions();
 });
 
-// تشغيل السيرفر على البورت 3000
-app.listen(3000, () => {
-    console.log('🌐 Multi-Instance WhatsApp Service running on port 3000');
-    // تشغيل الـ Auto-Boot فور قيام السيرفر لتشغيل الجلسات المخزنة
-    autoBootInstances();
-});
+module.exports = { app, server, activeSessions, startSession };

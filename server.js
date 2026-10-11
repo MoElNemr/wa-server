@@ -197,15 +197,17 @@ async function startSession(sessionId, meta = {}) {
         }
     });
 
-    // Handle inbound messages
+    // Handle messages (both inbound from customers and outbound from phone/web)
     sock.ev.on('messages.upsert', async (upsert) => {
         if (upsert.type !== 'notify') return;
 
         for (const msg of upsert.messages) {
-            if (!msg.message || msg.key.fromMe) continue;
+            if (!msg.message) continue;
 
             const from = msg.key.remoteJid;
-            if (!from || from === 'status@broadcast') continue;
+            if (!from || from === 'status@broadcast' || from.endsWith('@broadcast')) continue;
+
+            const isFromMe = Boolean(msg.key.fromMe);
 
             const text = msg.message.conversation ||
                          msg.message.extendedTextMessage?.text ||
@@ -217,12 +219,14 @@ async function startSession(sessionId, meta = {}) {
             const messageId = msg.key.id || `WA_${Date.now()}`;
             const pushName = msg.pushName || null;
 
-            console.log(`[Session ${sessionId}] Inbound message from [${from}]: "${text || '[media]'}"`);
+            console.log(`[Session ${sessionId}] ${isFromMe ? 'Outbound' : 'Inbound'} message [${from}]: "${text || '[media]'}"`);
 
             await dispatchWebhook(sessionEntry, 'messages.upsert', {
                 session_id: sessionId,
                 business_id: sessionEntry.businessId,
+                account_phone_number: sessionEntry.phoneNumber || (sock.user?.id ? sock.user.id.split(':')[0] : null),
                 from: from,
+                is_from_me: isFromMe,
                 push_name: pushName,
                 message_id: messageId,
                 text: text || '[رسالة وسائط]'

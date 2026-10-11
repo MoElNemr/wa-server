@@ -1,4 +1,4 @@
-const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, Browsers } = require('@whiskeysockets/baileys');
+const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, Browsers, fetchLatestBaileysVersion } = require('@whiskeysockets/baileys');
 const pino = require('pino');
 const express = require('express');
 const fs = require('fs');
@@ -26,7 +26,7 @@ const activeSessions = {};
  */
 function getSessionDir(sessionId) {
     const cleanId = String(sessionId).replace(/[^a-zA-Z0-9_-]/g, '_');
-    return path.join(AUTH_BASE_DIR, `session_${cleanId}`);
+    return path.join(AUTH_BASE_DIR, cleanId.startsWith('session_') ? cleanId : `session_${cleanId}`);
 }
 
 /**
@@ -94,12 +94,14 @@ async function startSession(sessionId, meta = {}) {
     activeSessions[sessionId] = sessionEntry;
 
     const { state, saveCreds } = await useMultiFileAuthState(sessionDir);
+    const { version } = await fetchLatestBaileysVersion().catch(() => ({ version: [2, 3000, 1043857760] }));
 
     const sock = makeWASocket({
+        version,
         auth: state,
         logger: LOGGER,
         printQRInTerminal: false,
-        browser: Browsers.ubuntu('Chrome'),
+        browser: Browsers.windows('Chrome'),
         connectTimeoutMs: 60000,
         keepAliveIntervalMs: 30000,
         syncFullHistory: false
@@ -120,7 +122,7 @@ async function startSession(sessionId, meta = {}) {
             sessionEntry.qr = qr;
             sessionEntry.status = 'connecting';
             try {
-                sessionEntry.qrImage = await qrcode.toDataURL(qr);
+                sessionEntry.qrImage = await qrcode.toDataURL(qr, { margin: 2, scale: 6 });
             } catch (qrErr) {
                 console.error(`[Session ${sessionId}] Failed to generate QR image: ${qrErr.message}`);
                 sessionEntry.qrImage = null;
@@ -338,9 +340,9 @@ app.post(['/api/sessions/start', '/api/instance/init'], async (req, res) => {
             webhook_url: webhookUrl
         });
 
-        // Wait up to 3 seconds for immediate QR generation before returning response
+        // Wait up to 6 seconds for immediate QR generation before returning response
         let attempts = 0;
-        while (attempts < 15 && !session.qr && session.status !== 'connected') {
+        while (attempts < 30 && !session.qrImage && !session.qr && session.status !== 'connected') {
             await new Promise(resolve => setTimeout(resolve, 200));
             attempts++;
         }
@@ -353,7 +355,12 @@ app.post(['/api/sessions/start', '/api/instance/init'], async (req, res) => {
             });
         }
 
-        if (session.qr) {
+        if (session.qrImage || session.qr) {
+            if (!session.qrImage && session.qr) {
+                try {
+                    session.qrImage = await qrcode.toDataURL(session.qr, { margin: 2, scale: 6 });
+                } catch (e) {}
+            }
             return res.json({
                 status: 'qr_ready',
                 session_id: sessionId,
@@ -440,6 +447,32 @@ app.get(['/api/sessions/:sessionId', '/api/instance/:sessionId'], (req, res) => 
         phone_number: session.phoneNumber,
         qr_code: session.qrImage || session.qr,
         qr_image: session.qrImage
+    });
+});
+
+// Dedicated QR code endpoint
+app.get(['/api/sessions/:sessionId/qr', '/api/instance/:sessionId/qr'], async (req, res) => {
+    const rawId = req.params.sessionId;
+    const sessionId = String(rawId).startsWith('session_') ? String(rawId) : `session_${rawId}`;
+    const session = activeSessions[sessionId];
+
+    if (!session) {
+        return res.status(404).json({ error: `Session ${sessionId} not found.` });
+    }
+
+    if (session.qr && !session.qrImage) {
+        try {
+            session.qrImage = await qrcode.toDataURL(session.qr, { margin: 2, scale: 6 });
+        } catch (e) {}
+    }
+
+    res.json({
+        session_id: session.sessionId,
+        business_id: session.businessId,
+        status: session.status,
+        qr_code: session.qrImage || session.qr,
+        qr_image: session.qrImage,
+        qr_raw: session.qr
     });
 });
 

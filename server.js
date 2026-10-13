@@ -209,11 +209,24 @@ async function startSession(sessionId, meta = {}) {
 
             const isFromMe = Boolean(msg.key.fromMe);
 
-            const text = msg.message.conversation ||
-                         msg.message.extendedTextMessage?.text ||
-                         msg.message.imageMessage?.caption ||
-                         msg.message.videoMessage?.caption ||
-                         msg.message.documentMessage?.caption ||
+            let m = msg.message;
+            if (m.ephemeralMessage?.message) m = m.ephemeralMessage.message;
+            if (m.viewOnceMessage?.message) m = m.viewOnceMessage.message;
+            if (m.viewOnceMessageV2?.message) m = m.viewOnceMessageV2.message;
+            if (m.documentWithCaptionMessage?.message) m = m.documentWithCaptionMessage.message;
+
+            const text = m.conversation ||
+                         m.extendedTextMessage?.text ||
+                         m.imageMessage?.caption ||
+                         m.videoMessage?.caption ||
+                         m.documentMessage?.caption ||
+                         (m.audioMessage ? '[تسجيل صوتي]' : null) ||
+                         (m.stickerMessage ? '[ملصق]' : null) ||
+                         (m.locationMessage ? '[موقع جغرافي]' : null) ||
+                         (m.contactMessage ? '[جهة اتصال]' : null) ||
+                         (m.imageMessage ? '[صورة]' : null) ||
+                         (m.videoMessage ? '[فيديو]' : null) ||
+                         (m.documentMessage ? '[مستند]' : null) ||
                          null;
 
             const messageId = msg.key.id || `WA_${Date.now()}`;
@@ -418,21 +431,20 @@ app.post(['/api/sessions/:sessionId/messages', '/api/instance/send'], async (req
     }
 
     try {
-        // Format recipient JID: support full JIDs (@lid, @s.whatsapp.net), known LIDs, and standard phone numbers
+        // Format recipient JID: support full JIDs (@lid, @s.whatsapp.net, @g.us, @newsletter), and standard phone numbers
         let targetJid;
-        if (String(to).includes('@')) {
-            targetJid = String(to).trim();
+        const toStr = String(to).trim();
+        if (toStr.includes('@')) {
+            targetJid = toStr;
         } else {
-            const cleanRecipient = String(to).replace(/[^0-9]/g, '');
-            const sessionDir = getSessionDir(sessionId);
-
-            // Check if recipient is a WhatsApp LID (via session files, tctoken, or 15+ digits identifier)
-            const isLid = fs.existsSync(path.join(sessionDir, `device-list-${cleanRecipient}.json`)) ||
-                          fs.existsSync(path.join(sessionDir, `identity-key-${cleanRecipient}_1.0.json`)) ||
-                          fs.existsSync(path.join(sessionDir, `tctoken-${cleanRecipient}@lid.json`)) ||
-                          cleanRecipient.length >= 15;
-
-            targetJid = isLid ? `${cleanRecipient}@lid` : `${cleanRecipient}@s.whatsapp.net`;
+            let cleanRecipient = toStr.replace(/[^0-9]/g, '');
+            // Normalize Egyptian local numbers (01xxxxxxxxx -> 201xxxxxxxxx)
+            if (cleanRecipient.startsWith('01') && cleanRecipient.length === 11) {
+                cleanRecipient = '2' + cleanRecipient;
+            } else if (cleanRecipient.startsWith('05') && cleanRecipient.length === 10) {
+                cleanRecipient = '966' + cleanRecipient.substring(1);
+            }
+            targetJid = `${cleanRecipient}@s.whatsapp.net`;
         }
 
         const sent = await session.sock.sendMessage(targetJid, { text });

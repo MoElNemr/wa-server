@@ -1,3 +1,5 @@
+require('dotenv').config();
+
 const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, Browsers, fetchLatestBaileysVersion } = require('@whiskeysockets/baileys');
 const pino = require('pino');
 const express = require('express');
@@ -8,6 +10,9 @@ const qrcode = require('qrcode');
 
 const PORT = process.env.PORT || 3000;
 const AUTH_BASE_DIR = path.join(__dirname, 'auth_info');
+const LARAVEL_APP_URL = process.env.LARAVEL_APP_URL || 'http://127.0.0.1:8000';
+const SHARED_SECRET = process.env.SHARED_SECRET || null;
+const CORS_ORIGIN = process.env.CORS_ORIGIN || LARAVEL_APP_URL;
 const LOGGER = pino({ level: 'silent' });
 
 if (!fs.existsSync(AUTH_BASE_DIR)) {
@@ -16,6 +21,24 @@ if (!fs.existsSync(AUTH_BASE_DIR)) {
 
 const app = express();
 app.use(express.json());
+
+// CORS - allow only Laravel domain
+app.use((req, res, next) => {
+    res.setHeader('Access-Control-Allow-Origin', CORS_ORIGIN);
+    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, DELETE, OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Shared-Secret');
+    if (req.method === 'OPTIONS') return res.sendStatus(200);
+    next();
+});
+
+// Shared secret validation (skip health check)
+app.use((req, res, next) => {
+    if (req.path === '/health' || req.path === '/api/health') return next();
+    if (SHARED_SECRET && req.headers['x-shared-secret'] !== SHARED_SECRET) {
+        return res.status(401).json({ error: 'Unauthorized' });
+    }
+    next();
+});
 
 // In-memory active session registry
 // Key: sessionId (string) -> { sock, sessionId, businessId, webhookUrl, status, phoneNumber, qr, qrImage, lastActiveAt }
@@ -65,7 +88,8 @@ async function startSession(sessionId, meta = {}) {
     }
 
     const businessId = meta.business_id || meta.businessId || sessionId.replace(/^session_/, '');
-    const webhookUrl = meta.webhook_url || meta.webhookUrl || `http://127.0.0.1:8000/webhooks/whatsapp/${businessId}`;
+    const laravelUrl = process.env.LARAVEL_APP_URL || 'http://127.0.0.1:8000';
+    const webhookUrl = meta.webhook_url || meta.webhookUrl || `${laravelUrl}/webhooks/whatsapp/${businessId}`;
 
     // Persist session metadata for auto-boot on server restart
     const metaFilePath = path.join(sessionDir, 'meta.json');

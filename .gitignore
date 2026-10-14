@@ -1,0 +1,15 @@
+node_modules/
+sessions/
+auth_info/
+auth_info_baileys/
+.wwebjs_auth/
+.wwebjs_cache/
+.env
+.env.*
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

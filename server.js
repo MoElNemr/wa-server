@@ -7,6 +7,7 @@ const axios = require('axios');
 const qrcode = require('qrcode');
 
 const PORT = process.env.PORT || 3000;
+const API_KEY = process.env.API_KEY || process.env.WA_SERVER_API_KEY || null;
 const AUTH_BASE_DIR = path.join(__dirname, 'auth_info');
 const LOGGER = pino({ level: 'silent' });
 
@@ -16,6 +17,31 @@ if (!fs.existsSync(AUTH_BASE_DIR)) {
 
 const app = express();
 app.use(express.json());
+
+// Authentication middleware
+app.use((req, res, next) => {
+    // Whitelist public health checks and root
+    if (req.path === '/' || req.path === '/health' || req.path === '/api/health') {
+        return next();
+    }
+
+    if (!API_KEY) {
+        return next();
+    }
+
+    const authHeader = req.headers['authorization'];
+    const bearerToken = authHeader && authHeader.startsWith('Bearer ') ? authHeader.slice(7).trim() : null;
+    const incomingKey = req.headers['x-api-key'] || bearerToken;
+
+    if (!incomingKey || incomingKey !== API_KEY) {
+        return res.status(401).json({
+            status: 'unauthorized',
+            error: 'Unauthorized: Missing or invalid API key'
+        });
+    }
+
+    next();
+});
 
 // In-memory active session registry
 // Key: sessionId (string) -> { sock, sessionId, businessId, webhookUrl, status, phoneNumber, qr, qrImage, lastActiveAt }
@@ -37,9 +63,15 @@ async function dispatchWebhook(sessionEntry, event, data) {
     if (!targetUrl) return;
 
     try {
+        const headers = { 'Content-Type': 'application/json', 'Accept': 'application/json' };
+        if (API_KEY) {
+            headers['x-api-key'] = API_KEY;
+            headers['x-webhook-secret'] = API_KEY;
+        }
+
         await axios.post(targetUrl, { event, data }, {
             timeout: 8000,
-            headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' }
+            headers
         });
         console.log(`[Session ${sessionEntry.sessionId}] Webhook "${event}" delivered to ${targetUrl}`);
     } catch (err) {
@@ -149,10 +181,10 @@ async function startSession(sessionId, meta = {}) {
             const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
 
             console.log(`[Session ${sessionId}] Connection closed (status: ${statusCode}). Reconnect: ${shouldReconnect}`);
-            sessionEntry.status = 'disconnected';
-            delete activeSessions[sessionId];
+            sessionEntry.status = shouldReconnect ? 'reconnecting' : 'disconnected';
 
             if (!shouldReconnect) {
+                delete activeSessions[sessionId];
                 console.log(`[Session ${sessionId}] User logged out. Cleaning up credentials.`);
                 if (fs.existsSync(sessionDir)) {
                     try {
@@ -285,16 +317,10 @@ function autoBootSessions() {
 // -----------------------------------------------------------------------------
 
 // Health check
-app.get('/health', (req, res) => {
+app.get(['/', '/health', '/api/health'], (req, res) => {
     res.json({
         status: 'ok',
-        uptime: process.uptime(),
-        active_sessions_count: Object.keys(activeSessions).length
-    });
-});
-app.get('/api/health', (req, res) => {
-    res.json({
-        status: 'ok',
+        service: 'VERTEX WhatsApp Baileys Service',
         uptime: process.uptime(),
         active_sessions_count: Object.keys(activeSessions).length
     });

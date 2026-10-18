@@ -8,15 +8,56 @@ const path = require('path');
 const axios = require('axios');
 const qrcode = require('qrcode');
 
+const crypto = require('crypto');
+
 const PORT = process.env.PORT || 3000;
 const AUTH_BASE_DIR = path.join(__dirname, 'auth_info');
 const LARAVEL_APP_URL = process.env.LARAVEL_APP_URL || 'http://127.0.0.1:8000';
-const SHARED_SECRET = process.env.SHARED_SECRET || null;
+const SHARED_SECRET = process.env.SHARED_SECRET || process.env.SERVER_SECRET || 'vertex_wa_secure_secret_key_2026';
+const TOKEN_MAX_AGE_SEC = 300; // 5 minutes
 const CORS_ORIGIN = process.env.CORS_ORIGIN || LARAVEL_APP_URL;
 const LOGGER = pino({ level: 'silent' });
 
 if (!fs.existsSync(AUTH_BASE_DIR)) {
     fs.mkdirSync(AUTH_BASE_DIR, { recursive: true });
+}
+
+/**
+ * Verify 5-minute rotating HMAC token.
+ */
+function verifyServerToken(token) {
+    if (!token || typeof token !== 'string') return false;
+    const parts = token.split('.');
+    if (parts.length !== 2) return false;
+    const [timestampStr, providedSignature] = parts;
+    const timestamp = parseInt(timestampStr, 10);
+    if (!timestamp || isNaN(timestamp)) return false;
+
+    const now = Math.floor(Date.now() / 1000);
+    // Token must be within 5-minute window (300s)
+    if (Math.abs(now - timestamp) > TOKEN_MAX_AGE_SEC) {
+        return false;
+    }
+
+    const expectedSignature = crypto
+        .createHmac('sha256', SHARED_SECRET)
+        .update(`${timestamp}:${SHARED_SECRET}`)
+        .digest('hex');
+
+    if (expectedSignature.length !== providedSignature.length) return false;
+    return crypto.timingSafeEqual(Buffer.from(expectedSignature), Buffer.from(providedSignature));
+}
+
+/**
+ * Generate 5-minute rotating HMAC token.
+ */
+function generateServerToken() {
+    const timestamp = Math.floor(Date.now() / 1000);
+    const signature = crypto
+        .createHmac('sha256', SHARED_SECRET)
+        .update(`${timestamp}:${SHARED_SECRET}`)
+        .digest('hex');
+    return `${timestamp}.${signature}`;
 }
 
 const app = express();
@@ -26,18 +67,53 @@ app.use(express.json());
 app.use((req, res, next) => {
     res.setHeader('Access-Control-Allow-Origin', CORS_ORIGIN);
     res.setHeader('Access-Control-Allow-Methods', 'GET, POST, DELETE, OPTIONS');
-    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Shared-Secret');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Shared-Secret, X-Server-Token');
     if (req.method === 'OPTIONS') return res.sendStatus(200);
     next();
 });
 
-// Shared secret validation (skip health check)
+// Authentication middleware (5-minute rotating token enforcement)
 app.use((req, res, next) => {
     if (req.path === '/health' || req.path === '/api/health') return next();
-    if (SHARED_SECRET && req.headers['x-shared-secret'] !== SHARED_SECRET) {
-        return res.status(401).json({ error: 'Unauthorized' });
+
+    const tokenHeader = req.headers['x-server-token'] || 
+        (req.headers['authorization']?.startsWith('Bearer ') ? req.headers['authorization'].slice(7) : null);
+    const secretHeader = req.headers['x-shared-secret'];
+
+    // 1. Verify 5-minute rotating token
+    if (tokenHeader) {
+        if (verifyServerToken(tokenHeader)) {
+            return next();
+        }
+        return res.status(401).json({
+            error: 'Unauthorized: Server token is invalid or expired (> 5 minutes). Must refresh token every 5 min.',
+            code: 'TOKEN_EXPIRED_OR_INVALID'
+        });
     }
-    next();
+
+    // 2. Allow direct pre-shared secret fallback for server bootstrap
+    if (SHARED_SECRET && secretHeader === SHARED_SECRET) {
+        return next();
+    }
+
+    return res.status(401).json({
+        error: 'Unauthorized: Missing or invalid authentication token. Valid 5-minute token required.',
+        code: 'AUTH_REQUIRED'
+    });
+});
+
+// Token issuance / refresh endpoint
+app.post('/api/auth/token', (req, res) => {
+    const secret = req.headers['x-shared-secret'] || req.body?.secret;
+    if (SHARED_SECRET && secret !== SHARED_SECRET) {
+        return res.status(401).json({ error: 'Unauthorized: Invalid secret' });
+    }
+    const token = generateServerToken();
+    res.json({
+        status: 'ok',
+        token,
+        expires_in: TOKEN_MAX_AGE_SEC
+    });
 });
 
 // In-memory active session registry
@@ -62,7 +138,12 @@ async function dispatchWebhook(sessionEntry, event, data) {
     try {
         await axios.post(targetUrl, { event, data }, {
             timeout: 8000,
-            headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' }
+            headers: {
+                'Content-Type': 'application/json',
+                'Accept': 'application/json',
+                'X-Server-Token': generateServerToken(),
+                'X-Shared-Secret': SHARED_SECRET
+            }
         });
         console.log(`[Session ${sessionEntry.sessionId}] Webhook "${event}" delivered to ${targetUrl}`);
     } catch (err) {
@@ -637,4 +718,4 @@ const server = app.listen(PORT, () => {
     autoBootSessions();
 });
 
-module.exports = { app, server, activeSessions, startSession };
+module.exports = { app, server, activeSessions, startSession, verifyServerToken, generateServerToken };

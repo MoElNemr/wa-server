@@ -9,6 +9,7 @@ const axios = require('axios');
 const qrcode = require('qrcode');
 
 const crypto = require('crypto');
+const cache = require('./cache');
 
 const PORT = process.env.PORT || 3000;
 const AUTH_BASE_DIR = path.join(__dirname, 'auth_info');
@@ -20,6 +21,18 @@ const LOGGER = pino({ level: 'silent' });
 
 if (!fs.existsSync(AUTH_BASE_DIR)) {
     fs.mkdirSync(AUTH_BASE_DIR, { recursive: true });
+}
+
+/**
+ * Invalidate cached session responses on any state change/update.
+ */
+function invalidateSessionCache(sessionId) {
+    cache.del('sessions:all');
+    if (sessionId) {
+        const cleanId = String(sessionId).startsWith('session_') ? String(sessionId) : `session_${sessionId}`;
+        cache.del(`session:${cleanId}`);
+        cache.del(`session:${sessionId}`);
+    }
 }
 
 /**
@@ -197,6 +210,7 @@ async function startSession(sessionId, meta = {}) {
         lastActiveAt: new Date().toISOString()
     };
     activeSessions[sessionId] = sessionEntry;
+    invalidateSessionCache(sessionId);
 
     const { state, saveCreds } = await useMultiFileAuthState(sessionDir);
     const { version } = await fetchLatestBaileysVersion().catch(() => ({ version: [2, 3000, 1043857760] }));
@@ -220,6 +234,7 @@ async function startSession(sessionId, meta = {}) {
     // Monitor connection events
     sock.ev.on('connection.update', async (update) => {
         const { connection, lastDisconnect, qr } = update;
+        invalidateSessionCache(sessionId);
 
         // 1. QR code received
         if (qr) {
@@ -227,6 +242,7 @@ async function startSession(sessionId, meta = {}) {
             console.log(`[Session ${sessionId}] QR code generated (standard format: ${cleanQr.substring(0, 15)}...).`);
             sessionEntry.qr = cleanQr;
             sessionEntry.status = 'connecting';
+            invalidateSessionCache(sessionId);
             try {
                 sessionEntry.qrImage = await qrcode.toDataURL(cleanQr, {
                     margin: 2,
@@ -405,8 +421,13 @@ app.get('/api/health', (req, res) => {
     });
 });
 
-// List all active sessions
+// List all active sessions (cached with instant invalidation on update)
 app.get(['/api/sessions', '/api/instances/active'], (req, res) => {
+    const cached = cache.get('sessions:all');
+    if (cached) {
+        return res.json(cached);
+    }
+
     const list = Object.keys(activeSessions).map(id => {
         const s = activeSessions[id];
         return {
@@ -418,10 +439,13 @@ app.get(['/api/sessions', '/api/instances/active'], (req, res) => {
         };
     });
 
-    res.json({
+    const result = {
         active_instances: Object.keys(activeSessions),
         sessions: list
-    });
+    };
+
+    cache.set('sessions:all', result, 60);
+    res.json(result);
 });
 
 // Start session / request QR code
@@ -569,24 +593,33 @@ app.post(['/api/sessions/:sessionId/messages', '/api/instance/send'], async (req
     }
 });
 
-// Single session details / status
+// Single session details / status (cached with instant invalidation on update)
 app.get(['/api/sessions/:sessionId', '/api/instance/:sessionId'], (req, res) => {
     const rawId = req.params.sessionId;
     const sessionId = String(rawId).startsWith('session_') ? String(rawId) : `session_${rawId}`;
+    const cacheKey = `session:${sessionId}`;
+    const cached = cache.get(cacheKey);
+    if (cached) {
+        return res.json(cached);
+    }
+
     const session = activeSessions[sessionId];
 
     if (!session) {
         return res.status(404).json({ error: `Session ${sessionId} not found.` });
     }
 
-    res.json({
+    const result = {
         session_id: session.sessionId,
         business_id: session.businessId,
         status: session.status,
         phone_number: session.phoneNumber,
         qr_code: session.qrImage || session.qr,
         qr_image: session.qrImage
-    });
+    };
+
+    cache.set(cacheKey, result, 60);
+    res.json(result);
 });
 
 // Dedicated QR code endpoint
@@ -692,6 +725,7 @@ const handleLogout = async (req, res) => {
     }
 
     delete activeSessions[sessionId];
+    invalidateSessionCache(sessionId);
 
     const sessionDir = getSessionDir(sessionId);
     if (fs.existsSync(sessionDir)) {
@@ -712,10 +746,16 @@ app.delete('/api/sessions/:sessionId', handleLogout);
 app.post('/api/sessions/:sessionId/logout', handleLogout);
 app.post('/api/instance/logout', handleLogout);
 
+// Cache flush endpoint
+app.post('/api/cache/clear', (req, res) => {
+    cache.flush();
+    res.json({ status: 'ok', message: 'Cache flushed successfully' });
+});
+
 // Start HTTP Server
 const server = app.listen(PORT, () => {
     console.log(`🚀 VERTEX WhatsApp Baileys Service running on port ${PORT}`);
     autoBootSessions();
 });
 
-module.exports = { app, server, activeSessions, startSession, verifyServerToken, generateServerToken };
+module.exports = { app, server, activeSessions, startSession, verifyServerToken, generateServerToken, cache, invalidateSessionCache };

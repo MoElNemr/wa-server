@@ -6,7 +6,6 @@ const express = require('express');
 const fs = require('fs');
 const path = require('path');
 const axios = require('axios');
-const qrcode = require('qrcode');
 
 const crypto = require('crypto');
 const cache = require('./cache');
@@ -205,8 +204,7 @@ async function startSession(sessionId, meta = {}) {
         sock: null,
         status: 'connecting',
         phoneNumber: null,
-        qr: null,
-        qrImage: null,
+        readyForPairing: false,
         lastActiveAt: new Date().toISOString()
     };
     activeSessions[sessionId] = sessionEntry;
@@ -236,32 +234,12 @@ async function startSession(sessionId, meta = {}) {
         const { connection, lastDisconnect, qr } = update;
         invalidateSessionCache(sessionId);
 
-        // 1. QR code received
+        // 1. Companion handshake / pairing code ready (QR is omitted, using pairing code only)
         if (qr) {
-            const cleanQr = qr.includes('#') ? qr.split('#')[1] : qr;
-            console.log(`[Session ${sessionId}] QR code generated (standard format: ${cleanQr.substring(0, 15)}...).`);
-            sessionEntry.qr = cleanQr;
+            console.log(`[Session ${sessionId}] Companion pairing handshake ready for phone number pairing.`);
+            sessionEntry.readyForPairing = true;
             sessionEntry.status = 'connecting';
             invalidateSessionCache(sessionId);
-            try {
-                sessionEntry.qrImage = await qrcode.toDataURL(cleanQr, {
-                    margin: 2,
-                    scale: 6,
-                    errorCorrectionLevel: 'M'
-                });
-            } catch (qrErr) {
-                console.error(`[Session ${sessionId}] Failed to generate QR image: ${qrErr.message}`);
-                sessionEntry.qrImage = null;
-            }
-
-            await dispatchWebhook(sessionEntry, 'connection.update', {
-                session_id: sessionId,
-                business_id: sessionEntry.businessId,
-                status: 'qr',
-                qr_code: sessionEntry.qrImage || cleanQr,
-                qr_raw: cleanQr,
-                qr_image: sessionEntry.qrImage
-            });
         }
 
         // 2. Connection closed
@@ -271,6 +249,7 @@ async function startSession(sessionId, meta = {}) {
 
             console.log(`[Session ${sessionId}] Connection closed (status: ${statusCode}). Reconnect: ${shouldReconnect}`);
             sessionEntry.status = 'disconnected';
+            sessionEntry.readyForPairing = false;
             delete activeSessions[sessionId];
 
             if (!shouldReconnect) {
@@ -304,8 +283,7 @@ async function startSession(sessionId, meta = {}) {
 
             sessionEntry.status = 'connected';
             sessionEntry.phoneNumber = formattedNumber;
-            sessionEntry.qr = null;
-            sessionEntry.qrImage = null;
+            sessionEntry.readyForPairing = false;
 
             console.log(`[Session ${sessionId}] WhatsApp connected. Number: ${formattedNumber}`);
 
@@ -435,7 +413,7 @@ app.get(['/api/sessions', '/api/instances/active'], (req, res) => {
             business_id: s.businessId,
             status: s.status,
             phone_number: s.phoneNumber,
-            has_qr: Boolean(s.qr)
+            ready_for_pairing: Boolean(s.readyForPairing)
         };
     });
 
@@ -448,7 +426,7 @@ app.get(['/api/sessions', '/api/instances/active'], (req, res) => {
     res.json(result);
 });
 
-// Start session / request QR code
+// Start session
 // Standard: POST /api/sessions/start
 // Legacy: POST /api/instance/init
 app.post(['/api/sessions/start', '/api/instance/init'], async (req, res) => {
@@ -475,56 +453,16 @@ app.post(['/api/sessions/start', '/api/instance/init'], async (req, res) => {
             });
         }
 
-        if (existing && existing.qr) {
-            return res.json({
-                status: 'qr_ready',
-                session_id: sessionId,
-                qr_code: existing.qrImage || existing.qr,
-                qr_image: existing.qrImage,
-                qr_raw: existing.qr
-            });
-        }
-
-        // Start session
-        const session = await startSession(sessionId, {
+        const session = existing || await startSession(sessionId, {
             business_id: businessId,
             webhook_url: webhookUrl
         });
 
-        // Wait up to 6 seconds for immediate QR generation before returning response
-        let attempts = 0;
-        while (attempts < 30 && !session.qrImage && !session.qr && session.status !== 'connected') {
-            await new Promise(resolve => setTimeout(resolve, 200));
-            attempts++;
-        }
-
-        if (session.status === 'connected') {
-            return res.json({
-                status: 'connected',
-                session_id: sessionId,
-                phone_number: session.phoneNumber
-            });
-        }
-
-        if (session.qrImage || session.qr) {
-            if (!session.qrImage && session.qr) {
-                try {
-                    session.qrImage = await qrcode.toDataURL(session.qr, { margin: 2, scale: 6 });
-                } catch (e) {}
-            }
-            return res.json({
-                status: 'qr_ready',
-                session_id: sessionId,
-                qr_code: session.qrImage || session.qr,
-                qr_image: session.qrImage,
-                qr_raw: session.qr
-            });
-        }
-
         return res.json({
-            status: 'connecting',
+            status: session.status,
             session_id: sessionId,
-            message: 'Session initialization in progress, QR will be pushed via webhook.'
+            ready_for_pairing: Boolean(session.readyForPairing),
+            message: 'Session ready. Request pairing code with phone number.'
         });
     } catch (err) {
         console.error(`[API] Error initializing session ${sessionId}:`, err);
@@ -614,38 +552,11 @@ app.get(['/api/sessions/:sessionId', '/api/instance/:sessionId'], (req, res) => 
         business_id: session.businessId,
         status: session.status,
         phone_number: session.phoneNumber,
-        qr_code: session.qrImage || session.qr,
-        qr_image: session.qrImage
+        ready_for_pairing: Boolean(session.readyForPairing)
     };
 
     cache.set(cacheKey, result, 60);
     res.json(result);
-});
-
-// Dedicated QR code endpoint
-app.get(['/api/sessions/:sessionId/qr', '/api/instance/:sessionId/qr'], async (req, res) => {
-    const rawId = req.params.sessionId;
-    const sessionId = String(rawId).startsWith('session_') ? String(rawId) : `session_${rawId}`;
-    const session = activeSessions[sessionId];
-
-    if (!session) {
-        return res.status(404).json({ error: `Session ${sessionId} not found.` });
-    }
-
-    if (session.qr && !session.qrImage) {
-        try {
-            session.qrImage = await qrcode.toDataURL(session.qr, { margin: 2, scale: 6 });
-        } catch (e) {}
-    }
-
-    res.json({
-        session_id: session.sessionId,
-        business_id: session.businessId,
-        status: session.status,
-        qr_code: session.qrImage || session.qr,
-        qr_image: session.qrImage,
-        qr_raw: session.qr
-    });
 });
 
 // Request 8-digit Pairing Code for phone number linking
@@ -667,9 +578,9 @@ app.post(['/api/sessions/pairing-code', '/api/sessions/:sessionId/pairing-code']
             });
         }
 
-        // Wait until WhatsApp companion registration handshake is ready (signaled by session.qr or connection open)
+        // Wait until companion registration handshake is ready (signaled by readyForPairing or connected)
         let attempts = 0;
-        while (attempts < 35 && !session.qr && session.status !== 'connected') {
+        while (attempts < 35 && !session.readyForPairing && session.status !== 'connected') {
             await new Promise(r => setTimeout(r, 200));
             attempts++;
         }

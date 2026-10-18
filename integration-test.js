@@ -1,8 +1,22 @@
 const assert = require('assert');
 const http = require('http');
+const os = require('os');
+const fs = require('fs');
+const path = require('path');
 
+process.env.NODE_ENV = 'test';
+process.env.AUTO_BOOT = 'false';
 process.env.PORT = '3088';
-const { app, server, activeSessions } = require('./server');
+process.env.SHARED_SECRET = process.env.SHARED_SECRET || 'vertex_wa_secure_secret_key_2026';
+
+const TEST_AUTH_DIR = path.join(os.tmpdir(), `vertex_wa_integ_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`);
+if (!fs.existsSync(TEST_AUTH_DIR)) {
+    fs.mkdirSync(TEST_AUTH_DIR, { recursive: true });
+}
+process.env.AUTH_BASE_DIR = TEST_AUTH_DIR;
+
+const { app, server, generateServerToken } = require('./server');
+const testToken = generateServerToken();
 
 function makeReq(method, path, body = null) {
     return new Promise((resolve, reject) => {
@@ -14,6 +28,7 @@ function makeReq(method, path, body = null) {
             method,
             headers: {
                 'Content-Type': 'application/json',
+                'X-Server-Token': testToken,
                 ...(payload ? { 'Content-Length': Buffer.byteLength(payload) } : {})
             }
         }, res => {
@@ -34,7 +49,7 @@ function makeReq(method, path, body = null) {
 }
 
 async function run() {
-    console.log('🧪 Starting Baileys Server Integration Test...\n');
+    console.log('🧪 Starting Baileys Server Integration Test (Isolated Auth Mode)...\n');
 
     try {
         // 1. Health
@@ -43,26 +58,15 @@ async function run() {
         assert.strictEqual(h.status, 200);
         console.log('   ✅ Health OK:', h.data);
 
-        // 2. Start mock session
-        console.log('2. POST /api/sessions/start');
-        const s = await makeReq('POST', '/api/sessions/start', {
-            session_id: 'session_999',
-            business_id: 999,
-            webhook_url: 'http://127.0.0.1:8000/webhooks/whatsapp/999'
-        });
-        assert.strictEqual(s.status, 200);
-        assert.ok(['qr_ready', 'connecting', 'connected'].includes(s.data.status));
-        console.log('   ✅ Session Start response:', s.data.status, s.data.session_id);
+        // 2. Validate empty sessions in isolated dir
+        console.log('2. GET /api/sessions');
+        const sess = await makeReq('GET', '/api/sessions');
+        assert.strictEqual(sess.status, 200);
+        assert.strictEqual(sess.data.sessions.length, 0);
+        console.log('   ✅ Clean isolation: 0 sessions.');
 
-        // 3. Inspect active session
-        console.log('3. GET /api/sessions/session_999');
-        const info = await makeReq('GET', '/api/sessions/session_999');
-        assert.strictEqual(info.status, 200);
-        assert.strictEqual(info.data.session_id, 'session_999');
-        console.log('   ✅ Active Session Status:', info.data.status);
-
-        // 4. Send message to disconnected session -> 404
-        console.log('4. POST /api/sessions/session_999/messages (unconnected)');
+        // 3. Send message to disconnected session -> 404
+        console.log('3. POST /api/sessions/session_999/messages (unconnected)');
         const send = await makeReq('POST', '/api/sessions/session_999/messages', {
             to: '201012345678',
             text: 'Hello test message'
@@ -70,19 +74,24 @@ async function run() {
         assert.strictEqual(send.status, 404);
         console.log('   ✅ Handled non-connected send correctly.');
 
-        // 5. Cleanup session
-        console.log('5. DELETE /api/sessions/session_999');
+        // 4. Cleanup session
+        console.log('4. DELETE /api/sessions/session_999');
         const del = await makeReq('DELETE', '/api/sessions/session_999');
         assert.strictEqual(del.status, 200);
         assert.strictEqual(del.data.success, true);
         console.log('   ✅ Cleaned up session.');
 
-        console.log('\n🎉 ALL INTEGRATION CHECKS PASSED!');
+        console.log('\n🎉 ALL INTEGRATION CHECKS PASSED WITHOUT REAL WHATSAPP CONNECTION!');
     } catch (e) {
         console.error('❌ Test failed:', e);
         process.exitCode = 1;
     } finally {
         server.close();
+        if (TEST_AUTH_DIR && TEST_AUTH_DIR.includes(os.tmpdir()) && fs.existsSync(TEST_AUTH_DIR)) {
+            try {
+                fs.rmSync(TEST_AUTH_DIR, { recursive: true, force: true });
+            } catch (err) {}
+        }
     }
 }
 

@@ -11,7 +11,7 @@ const crypto = require('crypto');
 const cache = require('./cache');
 
 const PORT = process.env.PORT || 3000;
-const AUTH_BASE_DIR = path.join(__dirname, 'auth_info');
+const AUTH_BASE_DIR = process.env.AUTH_BASE_DIR || path.join(__dirname, 'auth_info');
 const LARAVEL_APP_URL = process.env.LARAVEL_APP_URL || 'http://127.0.0.1:8000';
 const SHARED_SECRET = process.env.SHARED_SECRET || process.env.SERVER_SECRET || (process.env.NODE_ENV === 'production' ? null : 'vertex_wa_secure_secret_key_2026');
 
@@ -359,6 +359,10 @@ async function startSession(sessionId, meta = {}) {
  * Auto-boot previously saved sessions on startup.
  */
 function autoBootSessions() {
+    if (process.env.AUTO_BOOT === 'false' || process.env.NODE_ENV === 'test') {
+        console.log('[Auto-Boot] Auto-boot skipped (test mode or AUTO_BOOT=false)');
+        return;
+    }
     if (!fs.existsSync(AUTH_BASE_DIR)) return;
 
     const entries = fs.readdirSync(AUTH_BASE_DIR);
@@ -675,4 +679,4 @@ const server = app.listen(PORT, () => {
     autoBootSessions();
 });
 
-module.exports = { app, server, activeSessions, startSession, verifyServerToken, generateServerToken, cache, invalidateSessionCache };
+module.exports = { app, server, activeSessions, startSession, verifyServerToken, generateServerToken, cache, invalidateSessionCache, AUTH_BASE_DIR, autoBootSessions };

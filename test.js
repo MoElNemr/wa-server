@@ -1,10 +1,27 @@
 const assert = require('assert');
 const http = require('http');
+const os = require('os');
+const fs = require('fs');
+const path = require('path');
 
-// Set custom test port so we don't conflict
+// 1. Force test environment & disable session auto-boot
+process.env.NODE_ENV = 'test';
+process.env.AUTO_BOOT = 'false';
 process.env.PORT = '3099';
+process.env.SHARED_SECRET = process.env.SHARED_SECRET || 'vertex_wa_secure_secret_key_2026';
 
-const { app, server, activeSessions } = require('./server');
+// 2. Isolate auth storage in an empty temporary directory — never touches real auth_info
+const TEST_AUTH_DIR = path.join(os.tmpdir(), `vertex_wa_test_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`);
+if (!fs.existsSync(TEST_AUTH_DIR)) {
+    fs.mkdirSync(TEST_AUTH_DIR, { recursive: true });
+}
+process.env.AUTH_BASE_DIR = TEST_AUTH_DIR;
+
+// 3. Import server AFTER environment is configured
+const { app, server, generateServerToken } = require('./server');
+
+// 4. Generate rotating authentication token for test requests
+const testToken = generateServerToken();
 
 function makeRequest(method, path, body = null) {
     return new Promise((resolve, reject) => {
@@ -16,6 +33,7 @@ function makeRequest(method, path, body = null) {
             method: method,
             headers: {
                 'Content-Type': 'application/json',
+                'X-Server-Token': testToken,
                 ...(payload ? { 'Content-Length': Buffer.byteLength(payload) } : {})
             }
         };
@@ -39,7 +57,9 @@ function makeRequest(method, path, body = null) {
 }
 
 async function runTests() {
-    console.log('🧪 Starting WhatsApp Service Test Suite...\n');
+    console.log('🧪 Starting WhatsApp Service Test Suite (Isolated Test Environment)...\n');
+    console.log(`   Isolated Auth Dir: ${TEST_AUTH_DIR}`);
+    console.log(`   Session Auto-Boot: DISABLED (NODE_ENV=${process.env.NODE_ENV}, AUTO_BOOT=${process.env.AUTO_BOOT})\n`);
 
     try {
         // Test 1: Health check
@@ -49,13 +69,15 @@ async function runTests() {
         assert.strictEqual(health.data.status, 'ok');
         console.log('   ✅ Health check passed.');
 
-        // Test 2: List sessions
+        // Test 2: List sessions (authenticated with token, empty isolated dir)
         console.log('2. Testing GET /api/sessions');
         const sessions = await makeRequest('GET', '/api/sessions');
         assert.strictEqual(sessions.statusCode, 200);
         assert.ok(Array.isArray(sessions.data.sessions));
+        assert.strictEqual(sessions.data.sessions.length, 0, 'Isolated test dir must have 0 sessions');
         assert.ok(Array.isArray(sessions.data.active_instances));
-        console.log('   ✅ Sessions list passed.');
+        assert.strictEqual(sessions.data.active_instances.length, 0, 'No active instances should exist in test mode');
+        console.log('   ✅ Sessions list passed with 0 isolated sessions.');
 
         // Test 3: Legacy GET /api/instances/active
         console.log('3. Testing GET /api/instances/active');
@@ -85,19 +107,25 @@ async function runTests() {
         assert.strictEqual(inactiveSend.statusCode, 404);
         console.log('   ✅ Inactive session check passed.');
 
-        // Test 7: Logout / cleanup endpoint
+        // Test 7: Logout / cleanup endpoint on temporary test session
         console.log('7. Testing DELETE /api/sessions/session_temp_test');
         const logout = await makeRequest('DELETE', '/api/sessions/session_temp_test');
         assert.strictEqual(logout.statusCode, 200);
         assert.strictEqual(logout.data.success, true);
         console.log('   ✅ Logout endpoint passed.');
 
-        console.log('\n🎉 ALL TESTS PASSED SUCCESSFULLY!');
+        console.log('\n🎉 ALL ISOLATED TESTS PASSED SUCCESSFULLY! No external WhatsApp connections made.');
     } catch (err) {
         console.error('\n❌ Test failure:', err);
         process.exitCode = 1;
     } finally {
         server.close();
+        // Safe cleanup: remove isolated temp directory only
+        if (TEST_AUTH_DIR && TEST_AUTH_DIR.includes(os.tmpdir()) && fs.existsSync(TEST_AUTH_DIR)) {
+            try {
+                fs.rmSync(TEST_AUTH_DIR, { recursive: true, force: true });
+            } catch (e) {}
+        }
     }
 }
 

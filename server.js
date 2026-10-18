@@ -236,7 +236,7 @@ async function startSession(sessionId, meta = {}) {
 
         // 1. Companion handshake / pairing code ready (QR is omitted, using pairing code only)
         if (qr) {
-            console.log(`[Session ${sessionId}] Companion pairing handshake ready for phone number pairing.`);
+            console.log(`[Session ${sessionId}] Companion handshake initialized.`);
             sessionEntry.readyForPairing = true;
             sessionEntry.status = 'connecting';
             invalidateSessionCache(sessionId);

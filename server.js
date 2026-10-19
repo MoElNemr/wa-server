@@ -310,7 +310,7 @@ async function startSession(sessionId, meta = {}) {
             if (!msg.message) continue;
 
             const from = msg.key.remoteJid;
-            if (!from || from === 'status@broadcast' || from.endsWith('@broadcast')) continue;
+            if (!from || from === 'status@broadcast' || from.endsWith('@broadcast') || from.endsWith('@g.us') || from.endsWith('@newsletter')) continue;
 
             const isFromMe = Boolean(msg.key.fromMe);
 
